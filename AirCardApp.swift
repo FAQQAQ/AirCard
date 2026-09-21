@@ -915,15 +915,11 @@ class AppViewModel: ObservableObject {
         guard !isFlashing && !isBackingUp else { return }
         let alert = NSAlert()
         alert.messageText = "Choose artwork export method"
-        alert.informativeText = "Before exporting, turn off Express Mode for this card in Wallet, then open the card. You can turn Express Mode back on after export.\n\nExport Current Card Face extracts the existing FrontFace cache into PNG. It temporarily moves this cache and attempts to return it; it does not flash a new image. This is the current displayed card face, not guaranteed issuer-source artwork. Read-Only Files never moves originals but may fail on iOS. Combined Files exports the three filenames used by Flash Skins. No imported image is needed."
+        alert.informativeText = "Before exporting, turn off Express Mode for this card in Wallet, then open the card. You can turn Express Mode back on after export.\n\nExport Current Card Face extracts the existing FrontFace cache into PNG. It temporarily moves this cache and attempts to return it; it does not flash a new image. This is the current displayed card face, not guaranteed issuer-source artwork. No imported image is needed."
         alert.addButton(withTitle: "Export Current Card Face…")
         alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Read-Only Files")
-        alert.addButton(withTitle: "Combined Files (Experimental)…")
         switch alert.runModal() {
         case .alertFirstButtonReturn: backupSelectedCards(currentFace: true)
-        case .alertThirdButtonReturn: backupSelectedCards()
-        case NSApplication.ModalResponse(rawValue: 1003): backupSelectedCards(experimentalMove: true)
         default: break
         }
     }
@@ -3282,7 +3278,7 @@ struct ContentView: View {
                         Label(vm.isBackingUp ? "Backing Up…" : "Back Up Artwork", systemImage: "square.and.arrow.down")
                     }
                     .buttonStyle(.bordered)
-                    .help("Choose read-only export, or explicitly opt into a risky move export for one disposable test card. No custom image is required.")
+                    .help("Export the current card face as PNG. This temporarily moves its cache and attempts to return it. No custom image is required.")
                     .disabled(!vm.cards.contains { $0.isSelected } || vm.isFlashing || vm.isBackingUp || vm.device?.connected != true)
                     Button(action: { vm.requestApplySkin() }) {
                         HStack(spacing: 6) {
