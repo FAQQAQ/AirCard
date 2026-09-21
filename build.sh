@@ -43,9 +43,9 @@ cat << 'EOF' > "${CONTENTS_DIR}/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2.3</string>
+    <string>1.2.4</string>
     <key>CFBundleVersion</key>
-    <string>6</string>
+    <string>9</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>NSHighResolutionCapable</key>
@@ -72,6 +72,8 @@ cp build/airtraffic_host "$BIN_DIR/"
 cp apply_card_skin.py "$RESOURCES_DIR/"
 cp aircard.py "$RESOURCES_DIR/"
 cp aircard_backend.py "$RESOURCES_DIR/"
+cp card_backup_move.py "$RESOURCES_DIR/"
+cp wallet_asset_decode.py "$RESOURCES_DIR/"
 cp card_assets.py "$RESOURCES_DIR/"
 
 # A bundle without these cannot talk to a device at all, so fail here instead
@@ -91,8 +93,10 @@ if [ -z "${SWIFT_SDK:-}" ]; then
         SWIFT_SDK="$CLT_SWIFTUI_SDK"
     fi
 fi
-swiftc -sdk "$SWIFT_SDK" -O -parse-as-library -target arm64-apple-macosx14.0 AirCardApp.swift -o build/AirCard_arm64
-swiftc -sdk "$SWIFT_SDK" -O -parse-as-library -target x86_64-apple-macosx14.0 AirCardApp.swift -o build/AirCard_x86_64
+SWIFT_MODULE_CACHE="${SWIFT_MODULE_CACHE:-build/swift-module-cache}"
+mkdir -p "$SWIFT_MODULE_CACHE"
+swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -sdk "$SWIFT_SDK" -O -parse-as-library -target arm64-apple-macosx14.0 AirCardApp.swift Sources/AppRuntimePaths.swift Sources/CardScanEvidence.swift -o build/AirCard_arm64
+swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -sdk "$SWIFT_SDK" -O -parse-as-library -target x86_64-apple-macosx14.0 AirCardApp.swift Sources/AppRuntimePaths.swift Sources/CardScanEvidence.swift -o build/AirCard_x86_64
 lipo -create -output "${MACOS_DIR}/AirCard" build/AirCard_arm64 build/AirCard_x86_64
 chmod +x "${MACOS_DIR}/AirCard"
 

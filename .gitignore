@@ -8,3 +8,10 @@ build/
 .tmp/
 *.dmg
 .serena/
+# Private device data and recovery artifacts must never be published.
+AirCard-*/
+AirCard Backups/
+.recovery/
+Scan Evidence/
+Recovery Registry/
+outputs/

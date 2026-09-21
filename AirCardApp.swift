@@ -19,13 +19,18 @@ struct CardItem: Identifiable, Hashable {
     var isSelected: Bool = true
     var customImageURL: URL? = nil
     var customImage: NSImage? = nil
+    // Evidence applies only to the phone scanned in this app session. A log
+    // path does not establish that its files exist or are readable.
+    var observedCardPath: String? = nil
+    var observedDeviceID: String? = nil
     
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
     }
     
     static func == (lhs: CardItem, rhs: CardItem) -> Bool {
-        lhs.id == rhs.id && lhs.isSelected == rhs.isSelected && lhs.customImageURL == rhs.customImageURL
+        lhs.id == rhs.id && lhs.isSelected == rhs.isSelected && lhs.customImageURL == rhs.customImageURL &&
+            lhs.observedCardPath == rhs.observedCardPath && lhs.observedDeviceID == rhs.observedDeviceID
     }
 }
 
@@ -485,6 +490,7 @@ class AppViewModel: ObservableObject {
     @Published var cards: [CardItem] = []
     
     @Published var isFlashing = false
+    @Published var isBackingUp = false
     @Published var progress: Double = 0.0
     @Published var statusText: String = "Ready"
     @Published var logs: [String] = []
@@ -501,24 +507,24 @@ class AppViewModel: ObservableObject {
     private let legacyStorageKey1 = "mak5er.savedCards"
     private let legacyStorageKey2 = "LumiCards.savedCards"
     
-    nonisolated static let cardRegexes: [NSRegularExpression] = [
-        try! NSRegularExpression(pattern: "/(?:Cards|Passes/Cards)/([-A-Za-z0-9_+=]{20,44})(?:\\.pkpass|\\.cache|\\.pkcache|/|\\s|\"|'|\\)|,|$)"),
-        try! NSRegularExpression(pattern: "/([-A-Za-z0-9_+=]{20,44})\\.(?:pkpass|cache|pkcache)"),
-        try! NSRegularExpression(pattern: "(?<![A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{27}=)(?![A-Za-z0-9+/_-])")
-    ]
-    
     init() {
-        let cwd = FileManager.default.currentDirectoryPath
-        if let resPath = Bundle.main.resourcePath, FileManager.default.fileExists(atPath: resPath + "/aircard_backend.py") {
-            self.scriptDir = resPath
-        } else if FileManager.default.fileExists(atPath: cwd + "/aircard_backend.py") {
-            self.scriptDir = cwd
-        } else {
-            self.scriptDir = Bundle.main.bundleURL.deletingLastPathComponent().path
-        }
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let resolved = AppRuntimePaths.scriptDirectory(
+            resourceURL: Bundle.main.resourceURL,
+            executableURL: Bundle.main.executableURL,
+            currentDirectoryURL: cwd
+        )
+        self.scriptDir = (resolved ?? cwd).path
         
         loadSavedCards()
-        checkDevice()
+        log("Application: \(Bundle.main.executableURL?.path ?? "unknown")")
+        if resolved != nil {
+            checkDevice()
+        } else {
+            statusText = "AirCard backend is missing. Open the complete AirCard.app."
+            errorMessage = statusText
+            log(statusText)
+        }
     }
     
     func log(_ message: String) {
@@ -542,18 +548,10 @@ class AppViewModel: ObservableObject {
         return URL(fileURLWithPath: "/usr/bin/python3")
     }
     
-    nonisolated private static var deviceHelperExecutableURL: URL? {
-        var candidates: [String] = []
-        if let res = Bundle.main.resourceURL {
-            candidates.append(res.appendingPathComponent("bin/device_helper").path)
-        }
-        candidates.append("/Applications/AirCard.app/Contents/Resources/bin/device_helper")
-        for path in candidates {
-            if FileManager.default.isExecutableFile(atPath: path) {
-                return URL(fileURLWithPath: path)
-            }
-        }
-        return nil
+    private var deviceHelperExecutableURL: URL? {
+        AppRuntimePaths.deviceHelperURL(
+            scriptDirectory: URL(fileURLWithPath: scriptDir, isDirectory: true)
+        )
     }
     
     nonisolated private static var processEnvironment: [String: String] {
@@ -655,7 +653,7 @@ class AppViewModel: ObservableObject {
         loaded.removeAll { dummyHashes.contains($0) || ($0.contains("-") && $0.count == 36) }
         
         self.cards = loaded.map { CardItem(id: $0, isSelected: true) }
-        log("Loaded \(cards.count) real card(s) from storage.")
+        log("Loaded \(cards.count) saved identifier(s). Scan again to capture current card-path evidence.")
     }
     
     func saveCards() {
@@ -776,10 +774,12 @@ class AppViewModel: ObservableObject {
     }
     
     func startCardScanning() {
+        guard !isBackingUp && !isFlashing else { return }
         guard !isScanningCards else { return }
-        guard let deviceHelper = AppViewModel.deviceHelperExecutableURL else {
+        guard let deviceHelper = deviceHelperExecutableURL else {
             errorMessage = "Device tools are missing from this build."
-            log("Bundled device_helper not found — cannot scan.")
+            statusText = "Scanner helper is missing from this AirCard installation."
+            log("Cannot scan: no executable helper at \(scriptDir)/bin/device_helper or \(scriptDir)/build/device_helper")
             return
         }
         guard let udid = device?.udid else {
@@ -788,7 +788,20 @@ class AppViewModel: ObservableObject {
         }
         isScanningCards = true
         statusText = "Double-click Side button, pass Face ID, then tap your card..."
-        log("Started scanning device logs for cards...")
+        log("Scanner helper: \(deviceHelper.path)")
+        log("Scanner rules: Wallet Dashboard compatibility (scan-fix-1).")
+        log("Scanning Wallet identifiers and artwork paths; this does not read card images.")
+
+        var evidenceWriter: CardScanEvidenceWriter?
+        do {
+            let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                     appropriateFor: nil, create: true)
+            evidenceWriter = try CardScanEvidenceWriter(directory: support.appendingPathComponent("AirCard/Scan Evidence", isDirectory: true), deviceID: udid)
+            log("Private scan evidence: \(evidenceWriter!.fileURL.path) (up to 500 matching lines / 1 MiB)")
+        } catch {
+            log("Could not save scan evidence: \(error.localizedDescription). Identifier detection is still available.")
+        }
+        let scanEvidenceWriter = evidenceWriter
         
         let pipe = Pipe()
         let proc = Process()
@@ -800,17 +813,14 @@ class AppViewModel: ObservableObject {
         
         self.scanProcess = proc
         
-        let dummyHashes = [
-            "M6nDwZrkYbFlsodLgCbvyFZQ1cc=",
-            "kJL-D0rr-SZhbj2c8nK-OQ9hCMY=",
-            "hwAtAmHKYwsQrJbT5cTNDsaxVME="
-        ]
-        
         Task.detached {
             do {
                 try proc.run()
                 let handle = pipe.fileHandleForReading
                 var buffer = Data()
+                var reportedUnverified = Set<String>()
+                var evidenceWriteFailed = false
+                var reportedEvidenceLimit = false
                 
                 while proc.isRunning {
                     let chunk = handle.availableData
@@ -825,51 +835,44 @@ class AppViewModel: ObservableObject {
                         buffer.removeSubrange(buffer.startIndex..<newlineRange.upperBound)
                         
                         guard let line = String(data: lineData, encoding: .utf8) else { continue }
-                        let lower = line.lowercased()
-                        
-                        let isWalletSubsystem = lower.contains("passd") ||
-                                                lower.contains("passbook") ||
-                                                lower.contains("passkit") ||
-                                                lower.contains("stockholm") ||
-                                                lower.contains("nanopassd") ||
-                                                lower.contains("wallet") ||
-                                                lower.contains("/cards/")
-                        
-                        guard isWalletSubsystem else { continue }
-                        
-                        let isWalletContext = lower.contains("card") ||
-                                              lower.contains("pass") ||
-                                              lower.contains("payment") ||
-                                              lower.contains("pkpass") ||
-                                              lower.contains("uniqueid") ||
-                                              lower.contains("identifier") ||
-                                              lower.contains("face") ||
-                                              lower.contains("cache") ||
-                                              lower.contains("stockholm") ||
-                                              lower.contains("/cards/")
-                        
-                        guard isWalletContext else { continue }
-                        
-                        for regex in AppViewModel.cardRegexes {
-                            let matches = regex.matches(in: line, range: NSRange(line.startIndex..., in: line))
-                            for m in matches {
-                                if m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: line) {
-                                    let candidate = String(line[r])
-                                    if candidate.count == 36 && candidate.contains("-") { continue }
-                                    if dummyHashes.contains(candidate) { continue }
-                                    
-                                    await MainActor.run {
-                                        if !self.cards.contains(where: { $0.id == candidate }) {
-                                            self.cards.append(CardItem(id: candidate, isSelected: true))
-                                            self.saveCards()
-                                            self.log("Found card: \(candidate)")
-                                            NSSound(named: "Glass")?.play()
-                                        }
+                        let matches = CardScanEvidence.matches(in: line)
+                        guard !matches.isEmpty else { continue }
+                        if !evidenceWriteFailed, let writer = scanEvidenceWriter {
+                            do {
+                                try writer.append(line: line, matches: matches)
+                                if writer.isFull && !reportedEvidenceLimit {
+                                    reportedEvidenceLimit = true
+                                    await MainActor.run { self.log("Scan evidence limit reached; detection continues without saving more lines.") }
+                                }
+                            } catch {
+                                evidenceWriteFailed = true
+                                await MainActor.run { self.log("Scan evidence could not be saved: \(error.localizedDescription)") }
+                            }
+                        }
+                        for match in matches {
+                            let reportUnverified = !match.hasAbsolutePath && reportedUnverified.insert(match.cardID).inserted
+                            await MainActor.run {
+                                let existing = self.cards.firstIndex(where: { $0.id == match.cardID })
+                                if existing == nil {
+                                    self.cards.append(CardItem(id: match.cardID, isSelected: match.hasAbsolutePath))
+                                    self.saveCards()
+                                    NSSound(named: "Glass")?.play()
+                                }
+                                let index = existing ?? self.cards.count - 1
+                                if match.hasAbsolutePath, let path = match.containerPath {
+                                    if self.cards[index].observedCardPath != path || self.cards[index].observedDeviceID != udid {
+                                        self.cards[index].observedCardPath = path
+                                        self.cards[index].observedDeviceID = udid
+                                        self.log("Observed card path: \(path) — file access still unverified.")
                                     }
+                                } else if reportUnverified {
+                                    self.log("Unverified identifier: \(match.cardID). No full Wallet card path observed; inspect scan evidence before move export.")
                                 }
                             }
                         }
                     }
+                    // Bound malformed/unterminated service output as well.
+                    if buffer.count > 65_536 { buffer.removeAll(keepingCapacity: false) }
                 }
             } catch {
                 await MainActor.run {
@@ -892,8 +895,161 @@ class AppViewModel: ObservableObject {
     }
     
     // MARK: - Skin Application
+
+    func requestApplySkin() {
+        guard !isFlashing && !isBackingUp else { return }
+        let alert = NSAlert()
+        alert.messageText = "Back up current card artwork first?"
+        alert.informativeText = "Back Up First opens the artwork export options. Backing up does not flash a new skin. When finished, check your backup, then click Flash Skins again if you want to continue. Flash Without Backup replaces the artwork without creating a backup."
+        alert.addButton(withTitle: "Back Up First…")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Flash Without Backup")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: requestBackupArtwork()
+        case .alertThirdButtonReturn: applySkin()
+        default: break
+        }
+    }
+
+    func requestBackupArtwork() {
+        guard !isFlashing && !isBackingUp else { return }
+        let alert = NSAlert()
+        alert.messageText = "Choose artwork export method"
+        alert.informativeText = "Before exporting, turn off Express Mode for this card in Wallet, then open the card. You can turn Express Mode back on after export.\n\nExport Current Card Face extracts the existing FrontFace cache into PNG. It temporarily moves this cache and attempts to return it; it does not flash a new image. This is the current displayed card face, not guaranteed issuer-source artwork. Read-Only Files never moves originals but may fail on iOS. Combined Files exports the three filenames used by Flash Skins. No imported image is needed."
+        alert.addButton(withTitle: "Export Current Card Face…")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Read-Only Files")
+        alert.addButton(withTitle: "Combined Files (Experimental)…")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: backupSelectedCards(currentFace: true)
+        case .alertThirdButtonReturn: backupSelectedCards()
+        case NSApplication.ModalResponse(rawValue: 1003): backupSelectedCards(experimentalMove: true)
+        default: break
+        }
+    }
+
+    func backupSelectedCards(experimentalMove: Bool = false, currentFace: Bool = false) {
+        guard !isFlashing && !isBackingUp else { return }
+        let movesExistingAsset = experimentalMove || currentFace
+        guard let dev = device, dev.connected, let udid = dev.udid else {
+            errorMessage = "Please connect and trust your iPhone first."
+            return
+        }
+        let selected = cards.filter { $0.isSelected }
+        guard !selected.isEmpty else {
+            errorMessage = "Select at least one card to back up."
+            return
+        }
+        if movesExistingAsset {
+            guard selected.count == 1 else {
+                errorMessage = "Experimental export requires exactly one selected disposable test card."
+                return
+            }
+            if selected[0].observedCardPath == nil || selected[0].observedDeviceID != udid {
+                let warning = NSAlert()
+                warning.alertStyle = .warning
+                warning.messageText = "No full card path was observed for this identifier"
+                warning.informativeText = "Identifier: \(selected[0].id)\n\nA saved, manually entered, or bare log identifier does not prove that the expected card directory belongs to this card. Scan Cards can capture the actual Wallet path if iOS logs it. Continuing will use a guessed directory for an operation that moves files. Continue only if you independently confirmed this disposable card's identifier."
+                warning.addButton(withTitle: "Cancel and Scan")
+                warning.addButton(withTitle: "Use This Unverified Identifier")
+                guard warning.runModal() == .alertSecondButtonReturn else { return }
+            }
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = currentFace ? "Export the current card face from its cache?" : "Temporarily move this card's artwork?"
+            let operationNote = currentFace ? "This exports the existing .cache/FrontFace and extracts its faceImage PNG. It does not create a new card image or clear caches.\n\n" : ""
+            alert.informativeText = "Card: \(selected[0].id)\n\n\(operationNote)This may leave artwork missing if the device disconnects or the app stops. It will export one file at a time, return it, and re-read to compare bytes. The final return is observed indirectly, not guaranteed by a direct destination read. Keep the iPhone connected and do not operate Wallet, Books, or another Airlift tool until completion. Recovery files must be kept. No automatic flashing follows this test."
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Test This Disposable Card")
+            guard alert.runModal() == .alertSecondButtonReturn else { return }
+        }
+        let panel = NSOpenPanel()
+        panel.title = "Choose a folder for current artwork backups"
+        panel.message = movesExistingAsset
+            ? "Experimental move export: keep this folder, including its hidden recovery files, until Wallet has been checked."
+            : "Read-only device export: each card gets a new folder. Existing backups are never overwritten."
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        stopCardScanning()
+        isBackingUp = true
+        showLogs = true
+        progress = 0
+        statusText = "Backing up current artwork…"
+        let scriptDir = self.scriptDir
+        Task.detached {
+            var failure: String? = nil
+            for (index, card) in selected.enumerated() {
+                let process = Process()
+                process.executableURL = AppViewModel.pythonExecutableURL
+                process.environment = AppViewModel.processEnvironment
+                process.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
+                if currentFace {
+                    process.arguments = ["aircard_backend.py", "--backup-original-asset", udid, card.id, "cache", "FrontFace", directory.path, "--accept-move-risk"]
+                } else {
+                    process.arguments = ["aircard_backend.py", experimentalMove ? "--backup-card-move" : "--backup-card", udid, card.id, directory.path]
+                    if experimentalMove { process.arguments?.append("--accept-move-risk") }
+                }
+                let pipe = Pipe()
+                process.standardOutput = pipe
+                process.standardError = FileHandle.nullDevice
+                do {
+                    try process.run()
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    let lines = String(data: data, encoding: .utf8)?.split(separator: "\n") ?? []
+                    let result = lines.reversed().compactMap { line -> [String: Any]? in
+                        guard let json = String(line).data(using: .utf8) else { return nil }
+                        return (try? JSONSerialization.jsonObject(with: json)) as? [String: Any]
+                    }.first
+                    let path = result?["path"] as? String
+                    if process.terminationStatus != 0 || result?["ok"] as? Bool != true {
+                        failure = (result?["error"] as? String ?? "Backup failed; no complete backup was confirmed.")
+                            + (path.map { "\nBackup/recovery folder: \($0)" } ?? "")
+                        break
+                    }
+                    if currentFace && result?["decoded_card_image"] as? Bool != true {
+                        failure = "Original cache was saved, but no decodable faceImage was found. This is not yet a usable card-image export.\nBackup/recovery folder: \(path ?? directory.path)"
+                        break
+                    }
+                    await MainActor.run {
+                        self.progress = Double(index + 1) / Double(selected.count)
+                        self.log("Current artwork exported: \(path ?? directory.path)")
+                        if currentFace, let extraction = result?["extraction"] as? [String: Any],
+                           let imagePath = extraction["primary_image_path"] as? String {
+                            self.log("Current card face PNG exported: \(imagePath)")
+                            self.log("Source: existing .cache/FrontFace. This is a rendered cache image, not guaranteed original issuer PNG/PDF.")
+                        }
+                        if movesExistingAsset {
+                            self.log("Return/readback bytes matched. Final return is inferred; inspect Wallet before any further changes. Keep recovery files.")
+                        }
+                    }
+                } catch {
+                    failure = "Could not run backup: \(error.localizedDescription)"
+                    break
+                }
+            }
+            let finalFailure = failure
+            await MainActor.run {
+                self.isBackingUp = false
+                if let finalFailure {
+                    self.statusText = "Backup incomplete — no skin was flashed"
+                    self.errorMessage = finalFailure
+                    self.log(finalFailure)
+                } else {
+                    self.statusText = currentFace ? "Current card face exported — check Wallet; keep recovery files" :
+                        (experimentalMove ? "Artwork exported — check Wallet; keep recovery files" : "Current artwork backed up")
+                    self.log("Backup finished. To change the artwork, check your backup and start Flash Skins separately.")
+                    NSWorkspace.shared.open(directory)
+                }
+            }
+        }
+    }
     
     func applySkin() {
+        guard !isFlashing && !isBackingUp else { return }
         guard let udid = device?.udid else {
             errorMessage = "No iPhone connected."
             return
@@ -1112,6 +1268,7 @@ class AppViewModel: ObservableObject {
     }
     
     func flashPasscodeTheme() {
+        guard !isFlashing && !isBackingUp else { return }
         guard let theme = loadedPasscodeTheme else { return }
         guard let dev = device, dev.connected, let udid = dev.udid else {
             errorMessage = "Please connect and trust your iPhone first."
@@ -1338,6 +1495,7 @@ class AppViewModel: ObservableObject {
     }
     
     func flashCreatedTheme() {
+        guard !isFlashing && !isBackingUp else { return }
         let keys = effectiveCreatorKeys
         guard !keys.isEmpty else {
             errorMessage = "Please add at least one key icon or import a poster image first."
@@ -1550,6 +1708,12 @@ struct WalletCardView: View {
                 
                 Text("Card #\(cardIndex + 1)")
                     .font(.system(size: 12, weight: .semibold))
+
+                Image(systemName: card.observedCardPath == nil ? "questionmark.circle" : "doc.text.magnifyingglass")
+                    .foregroundColor(card.observedCardPath == nil ? .orange : .secondary)
+                    .font(.system(size: 11))
+                    .help(card.observedCardPath.map { "Path observed in Wallet log: \($0). Image files are not verified." }
+                          ?? "Unverified identifier: no full Wallet path captured in this session.")
                 
                 // Monospace Hash Pill with Copy
                 HStack(spacing: 4) {
@@ -1736,7 +1900,7 @@ struct ContentView: View {
                     Text("AirCard")
                         .font(.title2)
                         .fontWeight(.bold)
-                    Text("v1.2.3")
+                    Text("v1.2.4")
                         .font(.system(size: 10, weight: .bold, design: .rounded))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
@@ -3000,7 +3164,7 @@ struct ContentView: View {
     
     private var bottomBarView: some View {
         VStack(spacing: 8) {
-            if vm.isFlashing || vm.progress > 0 {
+            if vm.isFlashing || vm.isBackingUp || vm.progress > 0 {
                 ProgressView(value: vm.progress, total: 1.0)
                     .progressViewStyle(.linear)
                     .animation(.easeInOut(duration: 0.2), value: vm.progress)
@@ -3091,7 +3255,7 @@ struct ContentView: View {
                         .buttonStyle(.borderedProminent)
                         .tint(.purple)
                         .controlSize(.regular)
-                        .disabled(vm.effectiveCreatorKeys.isEmpty || vm.isFlashing || vm.device?.connected != true)
+                        .disabled(vm.effectiveCreatorKeys.isEmpty || vm.isFlashing || vm.isBackingUp || vm.device?.connected != true)
                     } else {
                         Button(action: { vm.flashPasscodeTheme() }) {
                             HStack(spacing: 6) {
@@ -3111,10 +3275,16 @@ struct ContentView: View {
                         .buttonStyle(.borderedProminent)
                         .tint(.purple)
                         .controlSize(.regular)
-                        .disabled(vm.loadedPasscodeTheme == nil || vm.isFlashing || vm.device?.connected != true)
+                        .disabled(vm.loadedPasscodeTheme == nil || vm.isFlashing || vm.isBackingUp || vm.device?.connected != true)
                     }
                 } else {
-                    Button(action: { vm.applySkin() }) {
+                    Button(action: { vm.requestBackupArtwork() }) {
+                        Label(vm.isBackingUp ? "Backing Up…" : "Back Up Artwork", systemImage: "square.and.arrow.down")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Choose read-only export, or explicitly opt into a risky move export for one disposable test card. No custom image is required.")
+                    .disabled(!vm.cards.contains { $0.isSelected } || vm.isFlashing || vm.isBackingUp || vm.device?.connected != true)
+                    Button(action: { vm.requestApplySkin() }) {
                         HStack(spacing: 6) {
                             if vm.isFlashing {
                                 ProgressView()
@@ -3132,7 +3302,7 @@ struct ContentView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.green)
                     .controlSize(.regular)
-                    .disabled(readyToFlashCount == 0 || vm.isFlashing || vm.device?.connected != true)
+                    .disabled(readyToFlashCount == 0 || vm.isFlashing || vm.isBackingUp || vm.device?.connected != true)
                 }
             }
             

@@ -17,6 +17,12 @@ PNG_1X1 = base64.b64decode(
 
 
 class CardFlashTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Exercise fallback writes without ever contacting a real helper/device.
+        batch = patch.object(aircard_backend, "write_files_batch", return_value=False)
+        batch.start()
+        self.addCleanup(batch.stop)
+
     def test_flash_writes_pdf_and_invalidates_placeholder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             image_path = Path(temporary) / "card.png"

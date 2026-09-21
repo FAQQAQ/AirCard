@@ -5,10 +5,12 @@ Backend engine for AirCard native macOS GUI app.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -48,6 +50,10 @@ from apply_card_skin import (
     build_archive_multi,
     ROOT,
     DEVICE_HELPER,
+    AIRTRAFFIC_HOST,
+    build_archive,
+    build_books,
+    run_json,
 )
 from card_assets import CACHE_FILES, build_card_assets
 from aircard import (
@@ -122,6 +128,132 @@ def cmd_prepare_image(src: str, dst: str):
         print(json.dumps({"ok": True, "path": dst}))
     except Exception as e:
         print(json.dumps({"ok": False, "error": str(e)}))
+
+
+ARTWORK_FILES = (
+    "cardBackgroundCombined@3x.png",
+    "cardBackgroundCombined@2x.png",
+    "cardBackgroundCombined.pdf",
+)
+
+
+def cmd_backup_card(udid: str, card_hash: str, output_dir: str) -> bool:
+    """Export current bytes, without moving/overwriting Wallet originals.
+
+    Every attempt gets a private, unique directory. Preserve Books recovery
+    inputs if cleanup fails; a backup is successful only after cleanup verifies.
+    """
+    result = {"ok": False, "type": "error", "card": card_hash, "device": udid}
+    backup = None
+    recovery = None
+    cleanup_needed = False
+    cleanup_ok = False
+    phase = "validate_inputs"
+    try:
+        if not re.fullmatch(r"[-A-Za-z0-9_+=]{20,44}", card_hash):
+            raise ValueError("Invalid card hash: expected 20–44 filename-safe hash characters")
+        if not udid or "\0" in udid:
+            raise ValueError("Invalid device identifier")
+        # The caller chooses a parent; never overwrite a previous backup.
+        parent = Path(output_dir).expanduser().resolve(strict=True)
+        if not parent.is_dir():
+            raise ValueError("Output directory must already exist")
+        token = secrets.token_hex(10)
+        backup = parent / f"AirCard-{card_hash}-{time.strftime('%Y%m%d-%H%M%S')}-{token}"
+        backup.mkdir(mode=0o700)
+        result["path"] = str(backup)
+        recovery = backup / ".recovery"
+        recovery.mkdir(mode=0o700)
+        snapshot = recovery / "books-snapshot"
+        snapshot.mkdir(mode=0o700)
+        source, link, recovered = (f"{prefix}{token}" for prefix in
+                                   ("airlift-src-", "airlift-link-", "airlift-recovered-"))
+        target = f"/var/mobile/Library/Passes/Cards/{card_hash}.pkpass"
+        result["source"] = target
+        identifier = f"../../{source}/p0/p1/p2/link"
+        archive = recovery / "link.zip"
+        books = recovery / "Books.plist"
+        # Stage requires a payload, but this dummy is never sent to a card.
+        archive.write_bytes(build_archive(target, b"backup-link-only"))
+        books.write_bytes(build_books([identifier]))
+        cleanup_args = ["finish-write", udid, source, link, recovered, str(snapshot)]
+        (recovery / "cleanup.json").write_text(json.dumps({
+            "helper": str(DEVICE_HELPER), "arguments": cleanup_args,
+            "note": "Retry cleanup only for this attempt, with the same device connected."
+        }, indent=2))
+        phase = "snapshot_books"
+        if not operation_ok(native("snapshot-books", udid, str(snapshot))):
+            raise RuntimeError("Could not snapshot Books state; backup was not staged")
+        cleanup_needed = True  # A timeout may occur after staging changed Books.
+        phase = "stage_link"
+        stage = native("stage", udid, source, link, recovered,
+                       str(archive), str(books), str(snapshot))
+        if stage.get("operation", {}).get("cleanupAuthorized") is False:
+            cleanup_needed = False
+        if not operation_ok(stage):
+            raise RuntimeError("Could not stage the backup link")
+        phase = "activate_link"
+        atc = run_json([str(AIRTRAFFIC_HOST), udid, identifier, link], timeout=120)
+        if atc.get("exitCode") != 0 or not atc.get("ok"):
+            raise RuntimeError("AirTraffic could not activate the backup link")
+        phase = "export_artwork"
+        exported = native("export-card-artwork", udid, link, str(backup))
+        operation = exported.get("operation", {})
+        if "diagnostics" in operation:
+            result["diagnostics"] = operation["diagnostics"]
+        if not operation_ok(exported):
+            result["error_code"] = operation.get("error", "export_failed")
+            result["leaf"] = operation.get("leaf")
+            raise RuntimeError(operation.get("message") or
+                               "Device did not permit artwork export; no original artwork was changed")
+        phase = "verify_local_files"
+        files = []
+        for leaf in ARTWORK_FILES:
+            path = backup / leaf
+            if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 16 * 1024 * 1024:
+                raise RuntimeError(f"Export verification failed: {leaf}")
+            data = path.read_bytes()
+            signature = b"%PDF-" if leaf.endswith(".pdf") else b"\x89PNG\r\n\x1a\n"
+            if not data.startswith(signature):
+                raise RuntimeError(f"Export is not the expected artwork format: {leaf}")
+            files.append({"name": leaf, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+        result.update(ok=True, type="success", files=files, source=target,
+                      message="Current artwork exported. Previously flashed artwork cannot be recovered as factory originals.")
+    except Exception as error:
+        result.update(ok=False, type="error", error=str(error), message=str(error), failure_phase=phase)
+    finally:
+        if cleanup_needed:
+            try:
+                cleanup_ok = operation_ok(native(*cleanup_args))
+            except Exception:
+                cleanup_ok = False
+            result["cleanup_complete"] = cleanup_ok
+            if not cleanup_ok:
+                result.update(ok=False, type="error", error_code="cleanup_failed",
+                              error="Device cleanup could not be verified. Keep the recovery directory and reconnect the same iPhone before retrying cleanup.",
+                              recovery_path=str(recovery))
+                result["message"] = result["error"]
+        if recovery and (cleanup_ok or not cleanup_needed):
+            # Only local files created by this attempt, inside its private dir.
+            import shutil
+            try:
+                shutil.rmtree(recovery)
+            except OSError as error:
+                result.update(
+                    ok=False,
+                    type="error",
+                    error=f"Local recovery cleanup failed: {error}",
+                    message=f"Local recovery cleanup failed: {error}",
+                )
+        if backup:
+            try:
+                with (backup / "manifest.json").open("x") as manifest:
+                    json.dump(result, manifest, indent=2)
+            except OSError as error:
+                result.update(ok=False, type="error", error=f"Could not save backup manifest: {error}")
+        print(json.dumps(result))
+        sys.stdout.flush()
+    return result["ok"]
 
 
 def cmd_flash(udid: str, card_hash: str, image_path: str) -> bool:
@@ -555,6 +687,17 @@ def cmd_flash_passthm(
         return False
 
 
+def run_device_operation(operation, udid: str, *arguments) -> bool:
+    """Serialize CLI/GUI mutations against experimental export and recovery."""
+    from card_backup_move import move_device_lock
+    try:
+        with move_device_lock(udid):
+            return operation(udid, *arguments)
+    except Exception as error:
+        print(json.dumps({"ok": False, "type": "error", "error": str(error), "message": str(error)}))
+        return False
+
+
 def main():
     if len(sys.argv) < 2:
         print(json.dumps({"error": "No command provided"}))
@@ -571,7 +714,50 @@ def main():
     elif norm_cmd == "prepare-image" and len(sys.argv) > 3:
         cmd_prepare_image(sys.argv[2], sys.argv[3])
     elif norm_cmd == "flash" and len(sys.argv) > 4:
-        if not cmd_flash(sys.argv[2], sys.argv[3], sys.argv[4]):
+        if not run_device_operation(cmd_flash, sys.argv[2], sys.argv[3], sys.argv[4]):
+            sys.exit(1)
+    elif norm_cmd == "backup-card" and len(sys.argv) == 5:
+        if not run_device_operation(cmd_backup_card, sys.argv[2], sys.argv[3], sys.argv[4]):
+            sys.exit(1)
+    elif norm_cmd == "backup-original-asset":
+        if len(sys.argv) != 8 or sys.argv[-1] != "--accept-move-risk":
+            print(json.dumps({"ok": False, "error":
+                "Usage: --backup-original-asset UDID HASH CONTAINER LEAF OUTPUT --accept-move-risk. Temporarily moves one existing visual asset; never writes a new picture."}))
+            sys.exit(1)
+        from card_backup_move import backup_original_asset
+        result = backup_original_asset(*sys.argv[2:7])
+        if result.get("ok"):
+            try:
+                from wallet_asset_decode import decode_asset
+                decoded_dir = Path(result["path"]) / "extracted-images"
+                decoded_dir.mkdir(mode=0o700)
+                result["extraction"] = decode_asset(result["files"][0]["path"], str(decoded_dir))
+                result["decoded_card_image"] = result["extraction"].get("card_face_decoded", False)
+                result["visually_verified"] = False
+            except Exception as error:
+                result["decode_error"] = str(error)
+            from card_backup_move import _atomic_json
+            _atomic_json(Path(result["path"]) / "manifest.json", result)
+        print(json.dumps(result))
+        sys.stdout.flush()
+        if not result.get("ok"):
+            sys.exit(1)
+    elif norm_cmd in ("backup-card-move", "recover-move-backup"):
+        expected_count = 6 if norm_cmd == "backup-card-move" else 5
+        if len(sys.argv) != expected_count or sys.argv[-1] != "--accept-move-risk":
+            print(json.dumps({"ok": False, "error":
+                "Experimental move export can interrupt Wallet artwork. Explicit --accept-move-risk is required; use only a disposable test card."}))
+            sys.exit(1)
+        from card_backup_move import backup_card_by_move, recover_move_backup
+        if norm_cmd == "backup-card-move":
+            result = backup_card_by_move(sys.argv[2], sys.argv[3], sys.argv[4])
+            success = result.get("ok") is True
+        else:
+            result = recover_move_backup(sys.argv[2], sys.argv[3])
+            success = result.get("recovery_completed") is True
+        print(json.dumps(result))
+        sys.stdout.flush()
+        if not success:
             sys.exit(1)
     elif norm_cmd == "inspect-passthm" and len(sys.argv) > 2:
         cmd_inspect_passthm(sys.argv[2])
@@ -579,7 +765,7 @@ def main():
         t_ver = sys.argv[4] if len(sys.argv) > 4 else "TelephonyUI-10"
         t_lang = sys.argv[5] if len(sys.argv) > 5 else "all"
         t_bold = sys.argv[6] if len(sys.argv) > 6 else "both"
-        if not cmd_flash_passthm(sys.argv[2], sys.argv[3], t_ver, t_lang, t_bold):
+        if not run_device_operation(cmd_flash_passthm, sys.argv[2], sys.argv[3], t_ver, t_lang, t_bold):
             sys.exit(1)
     else:
         print(json.dumps({"error": f"Unknown command: {cmd}"}))
