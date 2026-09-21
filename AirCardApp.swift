@@ -914,7 +914,7 @@ class AppViewModel: ObservableObject {
     func requestBackupArtwork() {
         guard !isFlashing && !isBackingUp else { return }
         let alert = NSAlert()
-        alert.messageText = "Choose artwork export method"
+        alert.messageText = "Export Current Card Face"
         alert.informativeText = "Before exporting, turn off Express Mode for this card in Wallet, then open the card. You can turn Express Mode back on after export.\n\nExport Current Card Face extracts the existing FrontFace cache into PNG. It temporarily moves this cache and attempts to return it; it does not flash a new image. This is the current displayed card face, not guaranteed issuer-source artwork. No imported image is needed."
         alert.addButton(withTitle: "Export Current Card Face…")
         alert.addButton(withTitle: "Cancel")

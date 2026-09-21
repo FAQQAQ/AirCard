@@ -87,7 +87,7 @@ class BackupUIFlowTests(unittest.TestCase):
 
     def test_current_face_is_available_in_english_export_picker(self):
         _, picker = swift_method(self.source, "requestBackupArtwork")
-        self.assertIn('alert.messageText = "Choose artwork export method"', picker)
+        self.assertIn('alert.messageText = "Export Current Card Face"', picker)
         self.assertIn('alert.addButton(withTitle: "Export Current Card Face…")', picker)
         self.assertRegex(
             picker,
